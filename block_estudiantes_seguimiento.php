@@ -11,87 +11,106 @@ class block_estudiantes_seguimiento extends block_base
     {
         global $DB, $USER;
 
-        // Verificar que el usuario tenga un departamento válido
-        if (!in_array($USER->department, ['PLANTA', 'CONTRATISTA'])) {
+        // Verificar departamento del usuario
+        $department = $USER->department;
+        $isPermanent = (strpos($department, 'PERMANENTE') !== false);
+        $isTemporary = (strpos($department, 'TEMPORAL') !== false);
+        $isContractor = ($department === 'CONTRATISTA');
+
+        if (!$isPermanent && !$isTemporary && !$isContractor) {
             return [];
         }
 
         try {
-            // Array con los IDs de los 7 cursos específicos
+            // Array con IDs de los 7 cursos específicos
             $course_ids = array(2, 3, 4, 5, 6, 8, 11);
             $results = [];
 
-            // Obtener los cursos en el mismo orden que export.php
+            // Obtener cursos
             $courses = $DB->get_records_list('course', 'id', $course_ids, 'sortorder, id');
 
             foreach ($courses as $course) {
-                // Obtener evaluaciones del curso usando exactamente la misma consulta que en export.php
+                // Consulta para obtener evaluaciones 
                 $sql_evaluaciones = "SELECT DISTINCT q.id, q.name
-                                  FROM {quiz} q
-                                  WHERE q.course = :courseid
-                                  AND (
-                                      (LOWER(q.name) LIKE '%evaluación de inducción%')
-                                      OR 
-                                      (LOWER(q.name) LIKE '%evaluación de reinducción%')
-                                  )
-                                  ORDER BY q.name ASC";
+                FROM {quiz} q
+                WHERE q.course = :courseid
+                AND (
+                    " . ($isTemporary || $isContractor ?
+                    "(LOWER(q.name) LIKE '%evaluación de inducción%')" :
+                    "(LOWER(q.name) LIKE '%evaluación de reinducción%')") . "
+                )
+                ORDER BY q.name ASC";
 
                 $evaluaciones = $DB->get_records_sql($sql_evaluaciones, ['courseid' => $course->id]);
 
                 if (!empty($evaluaciones)) {
                     foreach ($evaluaciones as $evaluacion) {
-                        // Verificar si el usuario tiene intentos para esta evaluación
-                        $sql_user = "SELECT 
-                           q.id as quiz_id,
-                           q.name as quiz_name,
-                           CASE 
-                               WHEN qa.state = 'finished' AND qa.sumgrades IS NOT NULL THEN 'completado' 
-                               ELSE 'pendiente' 
-                           END as estado,
-                           CASE 
-                               WHEN qa.state = 'finished' AND qa.sumgrades IS NOT NULL THEN 
-                                   ROUND((qa.sumgrades / q.grade) * 10, 2)
-                               ELSE 0 
-                           END as calificacion,
-                           COALESCE(qa.timefinish, ue.timemodified) as ultima_modificacion
-                       FROM {user} u
-                       JOIN {user_enrolments} ue ON u.id = ue.userid
-                       JOIN {enrol} e ON ue.enrolid = e.id
-                       JOIN {course} c ON e.courseid = c.id
-                       JOIN {quiz} q ON q.course = c.id AND q.id = :quizid
-                       LEFT JOIN (
-                           SELECT userid, quiz, state, sumgrades, timefinish
-                           FROM {quiz_attempts} qa1
-                           WHERE attempt = (
-                               SELECT MAX(attempt)
-                               FROM {quiz_attempts} qa2
-                               WHERE qa2.userid = qa1.userid 
-                               AND qa2.quiz = qa1.quiz
-                           )
-                       ) qa ON qa.userid = u.id AND qa.quiz = q.id
-                       WHERE 
-                           c.id = :courseid
-                           AND u.id = :userid
-                           AND ue.status = 0
-                           AND CASE 
-                               WHEN q.name LIKE '%Reinducción%' THEN 1 = 1
-                               WHEN q.name LIKE '%Inducción%' THEN :department = 'PLANTA'
-                           END";
+                        // Buscar el quiz completo para obtener la nota de aprobación
+                        $quiz = $DB->get_record('quiz', ['id' => $evaluacion->id]);
 
-                        $params = [
-                            'courseid' => $course->id,
-                            'quizid' => $evaluacion->id,
-                            'userid' => $USER->id,
-                            'department' => $USER->department
-                        ];
+                        // Valor predeterminado para nota mínima (6.0 sobre 10)
+                        $nota_minima_default = 6.0;
 
-                        $user_eval = $DB->get_record_sql($sql_user, $params);
-
-                        if ($user_eval) {
-                            $user_eval->course_id = $course->id;
-                            $user_eval->course_name = $course->fullname;
-                            $results[$evaluacion->name] = $user_eval;
+                        // Calcular nota mínima escalada
+                        if (!empty($quiz->grade) && !empty($quiz->gradepass)) {
+                            $nota_minima = ($quiz->gradepass / $quiz->grade) * 10;
+                        } else {
+                            // Si no hay información de nota mínima, usar el valor predeterminado
+                            $nota_minima = $nota_minima_default;
                         }
+
+                        // Comprobar si hay intentos para esta evaluación
+                        $intentos = $DB->get_records('quiz_attempts', [
+                            'quiz' => $evaluacion->id,
+                            'userid' => $USER->id,
+                            'state' => 'finished'
+                        ], 'attempt DESC');
+
+                        if (!empty($intentos)) {
+                            // Hay al menos un intento, tomar el último
+                            $intento = reset($intentos);
+
+                            // Calcular la calificación escalada a 10
+                            // Obtener directamente la calificación ya escalada
+                            $quiz_grade = $DB->get_record('quiz_grades', [
+                                'quiz' => $evaluacion->id,
+                                'userid' => $USER->id
+                            ]);
+
+                            if ($quiz_grade && isset($quiz_grade->grade)) {
+                                $calificacion = $quiz_grade->grade;
+                            } else {
+                                // Usar cálculo alternativo si no hay registro en quiz_grades
+                                $calificacion = !empty($quiz->grade) ? ($intento->sumgrades / $quiz->grade) * $this->NOTA_MAXIMA : 0;
+                            }
+
+                            $fecha = $intento->timefinish;
+
+                            // Verificar si aprobó o no (usando nota mínima calculada o predeterminada)
+                            if ($calificacion >= $nota_minima) {
+                                $estado = 'aprobado';
+                            } else {
+                                $estado = 'reprobado';
+                            }
+                        } else {
+                            // No hay intentos
+                            $estado = 'pendiente';
+                            $calificacion = 0;
+                            $fecha = null;
+                        }
+
+                        // Crear objeto de evaluación
+                        $user_eval = new stdClass();
+                        $user_eval->quiz_id = $evaluacion->id;
+                        $user_eval->quiz_name = $evaluacion->name;
+                        $user_eval->estado = $estado;
+                        $user_eval->calificacion = $calificacion;
+                        $user_eval->nota_minima = $nota_minima;
+                        $user_eval->ultima_modificacion = $fecha;
+                        $user_eval->course_id = $course->id;
+                        $user_eval->course_name = $course->fullname;
+
+                        $results[$evaluacion->name] = $user_eval;
                     }
                 }
             }
@@ -108,100 +127,47 @@ class block_estudiantes_seguimiento extends block_base
     {
         global $USER;
 
-        // Para usuarios PLANTA, incluir ambos tipos de evaluaciones
-        if ($USER->department === 'PLANTA') {
-            return array(
-                'GENERALIDADES DE LA INDUCCIÓN Y REINDUCCIÓN' => array(
-                    'Evaluación de Inducción del Módulo de Generalidades',
-                    'Evaluación de Reinducción del Módulo de Generalidades',
-                ),
-                'TALENTO HUMANO' => array(
-                    'Evaluación de Inducción del Submódulo Evaluación del desempeño ( EDL )',
-                    'Evaluación de Inducción del Submódulo Novedades administrativas',
-                    'Evaluación de Inducción del Submódulo Bienestar Social',
-                    'Evaluación de Inducción del Submódulo de Capacitación',
-                    'Evaluación de Inducción del Submódulo SSGT',
-                    'Evaluación de Inducción del Submódulo Comités',
-                    'Evaluación de Inducción del Módulo de Talento Humano',
-                    'Evaluación de Reinducción del Submódulo Evaluación del desempeño ( EDL )',
-                    'Evaluación de Reinducción del Submódulo Novedades administrativas',
-                    'Evaluación de Reinducción del Submódulo Bienestar Social',
-                    'Evaluación de Reinducción del Submódulo de Capacitación',
-                    'Evaluación de Reinducción del Submódulo SSGT',
-                    'Evaluación de Reinducción del Submódulo Comités',
-                    'Evaluación de Reinducción del Módulo de Talento Humano'
-                ),
-                'PROCESOS' => array(
-                    'Evaluación de Inducción del Módulo de Procesos',
-                    'Evaluación de Reinducción del Módulo de Procesos'
-                ),
-                'HERRAMIENTAS TÉCNOLOGICAS' => array(
-                    'Evaluación de Inducción del Submódulo Ophelia',
-                    'Evaluación de Inducción del Módulo de Herramientas Tecnológicas',
-                    'Evaluación de Reinducción del Submódulo Ophelia',
-                    'Evaluación de Reinducción del Módulo de Herramientas Tecnológicas'
-                ),
-                'SIGC' => array(
-                    'Evaluación de Inducción del Módulo de SIGC',
-                    'Evaluación de Reinducción del Módulo de SIGC'
-                ),
-                'SEGURIDAD INFORMATICA' => array(
-                    'Evaluación de Inducción del Módulo de Seguridad Informática',
-                    'Evaluación de Reinducción del Módulo de Seguridad Informática'
-                ),
-                'ENTÉRATE' => array(
-                    'Evaluación de Inducción del Módulo de Entérate',
-                    'Evaluación de Inducción del Submódulo Subdirección desarrollo sostenible',
-                    'Evaluación de Inducción del Submódulo Subdirección gestión comercial',
-                    'Evaluación de Inducción del Submódulo Oficina Asesora planeación',
-                    'Evaluación de Inducción del Submódulo Secretaria general',
-                    'Evaluación de Reinducción del Módulo de Entérate',
-                    'Evaluación de Reinducción del Submódulo Subdirección desarrollo sostenible',
-                    'Evaluación de Reinducción del Submódulo Subdirección gestión comercial',
-                    'Evaluación de Reinducción del Submódulo Oficina Asesora planeación',
-                    'Evaluación de Reinducción del Submódulo Secretaria general'
-                )
-            );
-        } else {
-            // Para CONTRATISTA, mantener solo evaluaciones de Reinducción
-            $prefix = 'Reinducción';
+        $department = $USER->department;
+        $isPermanent = (strpos($department, 'PERMANENTE') !== false);
+        $isTemporary = (strpos($department, 'TEMPORAL') !== false);
+        $isContractor = ($department === 'CONTRATISTA');
 
-            return array(
-                'GENERALIDADES DE LA INDUCCIÓN Y REINDUCCIÓN' => array(
-                    'Evaluación de ' . $prefix . ' del Módulo de Generalidades',
-                    'Evaluación de ' . $prefix . ' del Submódulo de Generalidades'
-                ),
-                'TALENTO HUMANO' => array(
-                    'Evaluación de ' . $prefix . ' del Submódulo Evaluación del desempeño ( EDL )',
-                    'Evaluación de ' . $prefix . ' del Submódulo Novedades administrativas',
-                    'Evaluación de ' . $prefix . ' del Submódulo Bienestar Social',
-                    'Evaluación de ' . $prefix . ' del Submódulo de Capacitación',
-                    'Evaluación de ' . $prefix . ' del Submódulo SSGT',
-                    'Evaluación de ' . $prefix . ' del Submódulo Comités',
-                    'Evaluación de ' . $prefix . ' del Módulo de Talento Humano'
-                ),
-                'PROCESOS' => array(
-                    'Evaluación de ' . $prefix . ' del Módulo de Procesos'
-                ),
-                'HERRAMIENTAS TÉCNOLOGICAS' => array(
-                    'Evaluación de ' . $prefix . ' del Submódulo Ophelia',
-                    'Evaluación de ' . $prefix . ' del Módulo de Herramientas Tecnológicas'
-                ),
-                'SIGC' => array(
-                    'Evaluación de ' . $prefix . ' del Módulo de SIGC'
-                ),
-                'SEGURIDAD INFORMATICA' => array(
-                    'Evaluación de ' . $prefix . ' del Módulo de Seguridad Informática'
-                ),
-                'ENTÉRATE' => array(
-                    'Evaluación de ' . $prefix . ' del Módulo de Entérate',
-                    'Evaluación de ' . $prefix . ' del Submódulo Subdirección desarrollo sostenible',
-                    'Evaluación de ' . $prefix . ' del Submódulo Subdirección gestión comercial',
-                    'Evaluación de ' . $prefix . ' del Submódulo Oficina Asesora planeación',
-                    'Evaluación de ' . $prefix . ' del Submódulo Secretaria general'
-                )
-            );
-        }
+        $prefix = ($isTemporary || $isContractor) ? 'Inducción' : 'Reinducción';
+
+        return array(
+            'GENERALIDADES DE LA INDUCCIÓN Y REINDUCCIÓN' => array(
+                'Evaluación de ' . $prefix . ' del Módulo de Generalidades',
+            ),
+            'TALENTO HUMANO' => array(
+                'Evaluación de ' . $prefix . ' del Submódulo Evaluación del desempeño ( EDL )',
+                'Evaluación de ' . $prefix . ' del Submódulo Novedades administrativas',
+                'Evaluación de ' . $prefix . ' del Submódulo Bienestar Social',
+                'Evaluación de ' . $prefix . ' del Submódulo de Capacitación',
+                'Evaluación de ' . $prefix . ' del Submódulo SSGT',
+                'Evaluación de ' . $prefix . ' del Submódulo Comités',
+                'Evaluación de ' . $prefix . ' del Módulo de Talento Humano'
+            ),
+            'PROCESOS' => array(
+                'Evaluación de ' . $prefix . ' del Módulo de Procesos'
+            ),
+            'HERRAMIENTAS TÉCNOLOGICAS' => array(
+                'Evaluación de ' . $prefix . ' del Submódulo Ophelia',
+                'Evaluación de ' . $prefix . ' del Módulo de Herramientas Tecnológicas'
+            ),
+            'SIGC' => array(
+                'Evaluación de ' . $prefix . ' del Módulo de SIGC'
+            ),
+            'SEGURIDAD INFORMATICA' => array(
+                'Evaluación de ' . $prefix . ' del Módulo de Seguridad Informática'
+            ),
+            'ENTÉRATE' => array(
+                'Evaluación de ' . $prefix . ' del Módulo de Entérate',
+                'Evaluación de ' . $prefix . ' del Submódulo Subdirección desarrollo sostenible',
+                'Evaluación de ' . $prefix . ' del Submódulo Subdirección gestión comercial',
+                'Evaluación de ' . $prefix . ' del Submódulo Oficina Asesora planeación',
+                'Evaluación de ' . $prefix . ' del Submódulo Secretaria general'
+            )
+        );
     }
 
     public function get_content()
@@ -213,13 +179,27 @@ class block_estudiantes_seguimiento extends block_base
         $this->content = new stdClass;
 
         // Verificar que el usuario tenga un departamento válido
-        if (!in_array($USER->department, ['PLANTA', 'CONTRATISTA'])) {
+        $department = $USER->department;
+        $isContratista = ($department === 'CONTRATISTA');
+        $isPlanta = (strpos($department, 'PLANTA') !== false);
+
+        if (!$isContratista && !$isPlanta) {
             $this->content->text = '
-           <div style="background-color: #f8f9fa; padding: 15px; border-radius: 5px; text-align: center;">
-               <p style="color: #721c24; font-weight: bold;">Departamento no válido</p>
-               <p>Su departamento actual no está configurado correctamente. Por favor, contacte al administrador.</p>
-           </div>';
+            <div style="background-color: #f8f9fa; padding: 15px; border-radius: 5px; text-align: center;">
+                <p style="color: #721c24; font-weight: bold;">Departamento no válido</p>
+                <p>Su departamento actual no está configurado correctamente. Por favor, contacte al administrador.</p>
+            </div>';
             return $this->content;
+        }
+
+        // Add the display department conversion here
+        $displayDepartment = $USER->department;
+        if (strpos($displayDepartment, 'PERMANENTE') !== false) {
+            $displayDepartment = 'PLANTA PERMANENTE';
+        } else if (strpos($displayDepartment, 'TEMPORAL') !== false) {
+            $displayDepartment = 'PLANTA TEMPORAL';
+        } else if ($displayDepartment === 'CONTRATISTA') {
+            $displayDepartment = 'CONTRATISTA';
         }
 
         // Obtener las evaluaciones del estudiante y la lista completa de evaluaciones
@@ -236,9 +216,9 @@ class block_estudiantes_seguimiento extends block_base
         $total_evaluations = 0;
         $completed_evaluations = 0;
 
-        // Contar directamente las evaluaciones completadas en user_evaluations
+        // Contar sólo las evaluaciones aprobadas en user_evaluations
         foreach ($user_evaluations as $eval) {
-            if ($eval->estado === 'completado') {
+            if ($eval->estado === 'aprobado') {
                 $completed_evaluations++;
             }
         }
@@ -252,10 +232,10 @@ class block_estudiantes_seguimiento extends block_base
             $total_evaluations += $module_total;
 
             foreach ($module_evaluations as $eval_name) {
-                // Verificar explícitamente si la evaluación existe y está completada
+                // Verificar explícitamente si la evaluación existe y está aprobada
                 if (
                     isset($user_evaluations_by_name[$eval_name]) &&
-                    $user_evaluations_by_name[$eval_name]->estado === 'completado'
+                    $user_evaluations_by_name[$eval_name]->estado === 'aprobado'
                 ) {
                     $module_completed++;
                 }
@@ -318,17 +298,17 @@ class block_estudiantes_seguimiento extends block_base
 
         // Información del estudiante con la barra de progreso global
         $this->content->text = '
-       <div class="estudiantes-seguimiento-container">
-           <div class="estudiante-info">
-               <div class="estudiante-nombre">Estudiante: ' . fullname($USER) . '</div>
-               <div class="estudiante-depto">Departamento: ' . ($USER->department ?? 'No especificado') . '</div>
-               <div class="progreso-global">
-                   <div class="progress-text">Progreso global: ' . $completed_evaluations . ' de ' . $total_evaluations . ' (' . $global_percentage . '%)</div>
-                   <div class="progress-bar">
-                       <div class="progress-fill" style="width: ' . $global_percentage . '%"></div>
-                   </div>
-               </div>
-           </div>';
+<div class="estudiantes-seguimiento-container">
+    <div class="estudiante-info">
+        <div class="estudiante-nombre">Estudiante: ' . fullname($USER) . '</div>
+        <div class="estudiante-depto">Departamento: ' . ($displayDepartment ?? 'No especificado') . '</div>
+        <div class="progreso-global">
+            <div class="progress-text">Progreso global: ' . $completed_evaluations . ' de ' . $total_evaluations . ' (' . $global_percentage . '%)</div>
+            <div class="progress-bar">
+                <div class="progress-fill" style="width: ' . $global_percentage . '%"></div>
+            </div>
+        </div>
+    </div>';
 
         // Barra de navegación de módulos
         $this->content->text .= '<div class="module-navbar">';
@@ -374,6 +354,7 @@ class block_estudiantes_seguimiento extends block_base
                            <th>Evaluación</th>
                            <th>Estado</th>
                            <th>Calificación</th>
+                           <th>Nota mínima</th>
                            <th>Última Modificación</th>
                        </tr>
                    </thead>
@@ -383,22 +364,35 @@ class block_estudiantes_seguimiento extends block_base
                 // Verificar si el usuario ha intentado esta evaluación
                 $estado = 'pendiente';
                 $calificacion = '0.00';
+                $nota_minima = '6.00';  // Valor predeterminado para mostrar
                 $fecha = '-';
+                $estado_class = 'status-pendiente';
+                $estado_text = 'Pendiente';
 
                 if (isset($user_evaluations_by_name[$eval_name])) {
                     $eval = $user_evaluations_by_name[$eval_name];
                     $estado = $eval->estado;
                     $calificacion = number_format($eval->calificacion, 2);
+                    $nota_minima = isset($eval->nota_minima) ? number_format($eval->nota_minima, 2) : '6.00';
                     $fecha = $eval->ultima_modificacion ? date('d/m/Y H:i', $eval->ultima_modificacion) : '-';
-                }
 
-                $estado_class = ($estado === 'completado') ? 'status-completado' : 'status-pendiente';
+                    if ($estado === 'aprobado') {
+                        $estado_class = 'status-completado';
+                        $estado_text = 'Aprobado';
+                    } else if ($estado === 'reprobado') {
+                        $estado_class = 'status-reprobado';
+                        $estado_text = 'Repetir evaluación';
+                    } else {
+                        $estado_text = 'Pendiente';
+                    }
+                }
 
                 $this->content->text .= '
                        <tr>
                            <td>' . $eval_name . '</td>
-                           <td><span class="status-badge ' . $estado_class . '">' . ucfirst($estado) . '</span></td>
+                           <td><span class="status-badge ' . $estado_class . '">' . $estado_text . '</span></td>
                            <td>' . $calificacion . '/10</td>
+                           <td>' . $nota_minima . '/10</td>
                            <td>' . $fecha . '</td>
                        </tr>';
             }
@@ -411,7 +405,7 @@ class block_estudiantes_seguimiento extends block_base
             $module_count++;
         }
 
-        // Estilos CSS (actualizado para incluir los estilos de las barras de progreso)
+        // Estilos CSS (actualizado para incluir los estilos de las barras de progreso y el nuevo estado)
         $this->content->text .= '
        <style>
            .estudiantes-seguimiento-container {
@@ -552,6 +546,11 @@ class block_estudiantes_seguimiento extends block_base
                color: #dc3545;
            }
            
+           .status-reprobado {
+               background-color: #fff3cd;
+               color: #fd7e14;
+           }
+           
            @media (max-width: 768px) {
                .module-navbar {
                    flex-direction: column;
@@ -576,7 +575,6 @@ class block_estudiantes_seguimiento extends block_base
         return $this->content;
     }
 
-    // Función para obtener un nombre corto del módulo para los botones
     // Función para obtener un nombre corto del módulo para los botones
     private function get_short_module_name($long_name)
     {
